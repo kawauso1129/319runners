@@ -15,7 +15,7 @@
 <div id="toast"><span id="toastMsg"></span><button id="toastBtn" hidden></button></div>
 
 <script type="module">
-import { $, esc, fmt, parseDur, clock, ls, uid, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer, randomWord, WORD_RE } from '../js/core.js';
+import { $, esc, fmt, parseDur, clock, ls, uid, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer, randomWord, WORD_RE, askConfirm, parsePace } from '../js/core.js';
 import { DEMO, openAdmin } from '../js/store.js';
 
 let api = null, user = null, denied = false, offset = 0;
@@ -170,18 +170,24 @@ const ACTIONS = {
   async saveRace() {
     const name = $('#rName').value.trim(), limitHours = parseFloat($('#rLimit').value), lapKm = parseFloat($('#rLap').value);
     need(name, '大会名を入力してください'); need(limitHours > 0, '制限時間を入力してください'); need(lapKm > 0, '1周の距離を入力してください');
+    const r0 = curRace();
+    const distChanged = r0 && (r0.lapKm !== lapKm || r0.limitHours !== limitHours);
+    if (distChanged && teams.some(t => (t.handoffs || []).length)) {
+      const ok = await askConfirm('周回記録が残っています。制限時間や距離を変えると、残っている記録の平均タイムで予測するため、周回数が大きくずれます。保存したあと「スタートと全チームの記録をリセット」で記録を消してください。このまま保存しますか？', '保存する');
+      if (!ok) return;
+    }
     await api.updateRace(raceId, r => ({ ...r, name, limitHours, lapKm }));
     document.activeElement?.blur(); toast('大会設定を保存しました');
   },
   async start() {
     need(teams.length, 'チームがありません');
-    if (!confirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？')) return;
+    if (!(await askConfirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？', 'スタート'))) return;
     const t = now();
     await api.updateRace(raceId, r => r.startAt ? null : { ...r, startAt: t });
     toast('スタートしました');
   },
   async resetRace() {
-    if (!confirm('スタート時刻と、この大会の全チームの記録をすべて消します。よろしいですか？')) return;
+    if (!(await askConfirm('スタート時刻と、この大会の全チームの記録をすべて消します。よろしいですか？', 'リセット', true))) return;
     await api.resetRace(raceId); toast('リセットしました');
   },
 
@@ -217,8 +223,8 @@ const ACTIONS = {
   async dSave() {
     syncDraft();
     const name = draft.name.trim(); need(name, 'チーム名を入力してください');
-    const rows = draft.rows.map(r => ({ ...r, name: r.name.trim(), paceSec: parseDur(r.pace) }));
-    for (const r of rows) { need(r.name, '名前が空のメンバーがいます'); need(r.paceSec > 0, `${r.name} のペースを 5:30 のように入力してください`); }
+    const rows = draft.rows.map(r => ({ ...r, name: r.name.trim(), paceSec: parsePace(r.pace) }));
+    for (const r of rows) { need(r.name, '名前が空のメンバーがいます'); need(r.paceSec > 0, `${r.name} のペースを 5:30 のように入力してください（2:00〜20:00/km）`); }
     await api.updateTeam(draft.word, tm => {
       const keep = new Set(rows.map(r => r.id));
       const withLaps = new Set((tm.handoffs || []).map(h => h.runnerId));
@@ -240,10 +246,10 @@ const ACTIONS = {
   },
   async teamDel(b) {
     const t = teams.find(x => x.word === b.dataset.word); if (!t) return;
-    if (!confirm(`「${t.name}」を削除します。メンバーと記録もすべて消えます。よろしいですか？`)) return;
+    if (!(await askConfirm(`「${t.name}」を削除します。メンバーと記録もすべて消えます。よろしいですか？`, '削除', true))) return;
     await api.deleteTeam(t.word); toast('削除しました');
   },
-  demoReset() { if (confirm('デモデータを初期化しますか？')) { api.resetDemo(); selectRace('demo'); toast('初期化しました'); } },
+  async demoReset() { if (await askConfirm('デモデータを初期化しますか？', '初期化', true)) { api.resetDemo(); selectRace('demo'); toast('初期化しました'); } },
   dlgClose() { draft = null; closeDlg(); },
 };
 

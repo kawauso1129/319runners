@@ -23,7 +23,7 @@
 
 <script type="module">
 import { LOCK_SEC, GRACE_SEC, OUTLIER } from './js/config.js';
-import { $, esc, fmt, fmtGap, parseDur, clock, sleep, ls, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer } from './js/core.js';
+import { $, esc, fmt, fmtGap, parseDur, clock, sleep, ls, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer, askConfirm, parsePace } from './js/core.js';
 import { DEMO, openTeam } from './js/store.js';
 
 const teamWord = new URLSearchParams(location.search).get('team');
@@ -285,7 +285,7 @@ const ACTIONS = {
   tab(b) { tab = b.dataset.tab; ls.set('relay.tab', tab); render(); window.scrollTo(0, 0); },
 
   async start() {
-    if (!confirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？')) return;
+    if (!(await askConfirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？', 'スタート'))) return;
     const t = now();
     await store.transact(rc => {
       if (rc.startAt) return { result: 'already' };
@@ -378,8 +378,8 @@ const ACTIONS = {
 
   async savePaces() {
     const paces = {};
-    document.querySelectorAll('[data-mpace]').forEach(i => { paces[i.dataset.mpace] = parseDur(i.value); });
-    for (const v of Object.values(paces)) need(v > 0, 'ペースは 5:30 のように全員分入力してください');
+    document.querySelectorAll('[data-mpace]').forEach(i => { paces[i.dataset.mpace] = parsePace(i.value); });
+    for (const v of Object.values(paces)) need(v > 0, 'ペースは 5:30 のように全員分入力してください（2:00〜20:00/km）');
     await store.transact((rc, tm) => {
       (tm.members || []).forEach(mm => { if (paces[mm.id] > 0) mm.paceSec = paces[mm.id]; });
       return { team: tm, result: 'ok' };

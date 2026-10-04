@@ -17,10 +17,21 @@ export function fmtGap(ms) {
   if (Math.abs(ms) < 500) return '±0:00';
   return ms < 0 ? `<span class="good">-${fmt(-ms)}</span>` : `<span class="bad">+${fmt(ms)}</span>`;
 }
-export function parseDur(str) { // "5:30" → 330 / "1:02:03" → 3723（秒）
-  const p = String(str ?? '').trim().split(':');
-  if (!p[0] || p.some(x => x === '' || isNaN(+x))) return null;
+export function parseDur(str) { // "5:30" → 330 / "1:02:03" → 3723（秒）。全角・「5.30」「5'30」「5分30秒」も 5:30 と読む
+  const s = String(str ?? '').trim()
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[：.．'’′"”″]|分|時間?/g, ':').replace(/秒/g, '').replace(/:+$/, '');
+  let p = s.split(':');
+  if (p.length === 1 && /^\d{3,4}$/.test(p[0])) p = [p[0].slice(0, -2), p[0].slice(-2)]; // "530" → 5:30
+  if (!p[0] || p.some(x => x === '' || !/^\d+$/.test(x))) return null;
+  if (p.slice(1).some(x => x.length !== 2 || +x >= 60)) return null; // 秒・分は2桁（「5.3」のような曖昧な入力は弾く）
   return p.map(Number).reduce((a, b) => a * 60 + b, 0);
+}
+/* 1kmあたりのペース。2:00〜20:00/km の範囲外は入力ミスとして扱う */
+export const PACE_MIN = 120, PACE_MAX = 1200;
+export function parsePace(str) {
+  const v = parseDur(str);
+  return v != null && v >= PACE_MIN && v <= PACE_MAX ? v : null;
 }
 export function clock(ms) { if (ms == null) return '—'; const d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
 export const ls = {
@@ -121,6 +132,21 @@ export function toast(msg, btn, fn, ms = 3500) {
   $('#toast').style.display = 'flex';
   clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').style.display = 'none'; }, ms);
 }
+/* ブラウザ標準の confirm() はブロックされることがあるため、画面内の確認ダイアログを使う */
+export function askConfirm(msg, okLabel = 'OK', danger = false) {
+  return new Promise(resolve => {
+    let d = document.getElementById('cfm');
+    if (!d) { d = document.createElement('dialog'); d.id = 'cfm'; document.body.appendChild(d); }
+    d.innerHTML = `<p style="margin:0 0 6px;line-height:1.7">${esc(msg)}</p>
+      <div class="btns" style="justify-content:flex-end"><button class="b" data-c="0">キャンセル</button><button class="b ${danger ? 'danger' : 'primary'}" data-c="1">${esc(okLabel)}</button></div>`;
+    let settled = false;
+    const done = v => { if (settled) return; settled = true; if (d.open) d.close(); resolve(v); };
+    d.querySelectorAll('[data-c]').forEach(b => { b.onclick = e => { e.stopPropagation(); done(b.dataset.c === '1'); }; });
+    d.oncancel = () => done(false);
+    d.showModal();
+  });
+}
+
 export function openDlg(html) { $('#dlgBody').innerHTML = html; if (!$('#dlg').open) $('#dlg').showModal(); }
 export function closeDlg() { $('#dlg').close(); }
 
