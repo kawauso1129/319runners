@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#e4572e">
+<meta name="robots" content="noindex">
+<title>リレー周回予測</title>
+<link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+<header><div class="hwrap"><div><div class="htitle" id="hTitle">リレー周回予測</div><div class="hsub" id="hSub"></div></div><div class="hclock" id="hClock"></div></div></header>
+<main id="app"><div class="card center muted">読み込み中…</div></main>
+<nav id="nav" hidden><div class="nwrap">
+  <button data-act="tab" data-tab="main">計測</button>
+  <button data-act="tab" data-tab="members">メンバー</button>
+  <button data-act="tab" data-tab="predict">予測</button>
+  <button data-act="tab" data-tab="settings">設定</button>
+  <button data-act="tab" data-tab="after">大会後</button>
+</div></nav>
+<dialog id="dlg"><div id="dlgBody"></div></dialog>
+<div id="toast"><span id="toastMsg"></span><button id="toastBtn" hidden></button></div>
+
+<script type="module">
+import { LOCK_SEC, GRACE_SEC, OUTLIER } from './js/config.js';
+import { $, esc, fmt, fmtGap, parseDur, clock, sleep, ls, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer } from './js/core.js';
+import { DEMO, openTeam } from './js/store.js';
+
+const teamWord = new URLSearchParams(location.search).get('team');
+let nickname = ls.get('relay.nick') || '';
+
+/* ---------- 状態 ---------- */
+let store = null, race = null, team = null, offset = 0;
+let tab = ls.get('relay.tab') || 'main';
+let tickN = 0, autoBusy = false, flushing = false;
+const pendingTaps = [];
+const now = () => Date.now() + offset;
+const M = () => new Model(race, team);
+const app = $('#app');
+
+/* ---------- 画面 ---------- */
+function fatal(msg) {
+  $('#nav').hidden = true;
+  app.innerHTML = `<div class="card"><h2>表示できません</h2><p>${esc(msg)}</p></div>`;
+}
+
+function render() {
+  if (!race || !team) return;
+  const m = M();
+  $('#hTitle').textContent = race.name || 'リレー周回予測';
+  $('#hSub').innerHTML = esc(team.name || '') + (DEMO ? ' <span class="tag demo">デモ</span>' : '');
+  $('#hClock').innerHTML = `経過 <b data-live="raceElapsed">—</b><br>残り <span data-live="raceRemain">—</span>`;
+  $('#nav').hidden = false;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  const views = { main: viewMain, members: viewMembers, predict: viewPredict, settings: viewSettings, after: viewAfter };
+  app.innerHTML = (views[tab] || viewMain)(m);
+  renderLive();
+}
+const requestRender = makeRenderer(app, render);
+
+function summary(m, p) {
+  return `<section class="card"><div class="grid2">
+    <div><div class="muted small">予想確定周回数</div><div class="num">${p.count}<small>周</small></div></div>
+    <div><div class="muted small">最終確定周の走者</div><div class="num sm">${esc(p.lastRunner ? m.name(p.lastRunner) : '—')}</div></div>
+    <div><div class="muted small">最終周ゴール予想</div><div class="num sm">${p.lastFinish ? clock(p.lastFinish) : '—'}</div></div>
+    <div><div class="muted small">制限時間までの余り</div><div class="num sm">${fmt(p.margin)}</div></div>
+  </div></section>`;
+}
+
+function viewMain(m) {
+  const p = m.predict(now());
+  if (!m.activeOrder().length) return `<div class="card">メンバーが登録されていません。管理者に登録を依頼してください。</div>`;
+  if (!m.started) return `
+    <section class="card center">
+      <div class="muted">スタート前・第1走者</div>
+      <div class="big">${esc(m.name(m.currentRunner()))}</div>
+      <button class="touch start" data-act="start">スタート</button>
+      <div class="muted small">全チーム共通のスタートです</div>
+    </section>${summary(m, p)}`;
+  const runner = m.currentRunner();
+  const ended = now() > m.deadline;
+  const lapNo = (team.handoffs || []).length + 1;
+  const st = m.stats(runner);
+  return `
+    ${team.current?.provisional && !ended ? `<div class="banner warn">暫定記録中：前の中継を自動で記録しました。実際の中継がまだなら、たすき渡しの瞬間にタッチしてください（その時刻に訂正されます）</div>` : ''}
+    ${pendingTaps.length ? `<div class="banner">送信待ち ${pendingTaps.length}件（電波が戻ると自動送信します）</div>` : ''}
+    <section class="card center">
+      ${ended ? `<div class="big">制限時間終了</div><p class="muted">「大会後」タブで記録を確認してください。</p>` : `
+      <div class="muted">${lapNo}周目を走行中</div>
+      <div class="big">${esc(m.name(runner))}</div>
+      <div class="timer" data-live="lapElapsed">—</div>
+      <div class="row3">
+        <div><span class="muted small">目安</span><b>${fmt(st.tgt)}</b></div>
+        <div><span class="muted small">目安まで</span><b data-live="toTarget">—</b></div>
+        <div><span class="muted small">本人平均</span><b>${fmt(st.avg)}</b></div>
+      </div>
+      <button class="touch" data-act="tap" data-live="tapBtn">タッチ（中継）</button>
+      <div class="next">次走者：<b>${esc(m.name(m.nextAfter(runner)))}</b></div>
+      <button class="b" data-act="swapOpen">走者を差し替え</button>`}
+    </section>${summary(m, p)}`;
+}
+
+function viewMembers(m) {
+  const cur = m.started ? m.currentRunner() : null;
+  const cards = (team.order || []).map((id, i) => {
+    const mm = m.mem(id); if (!mm) return '';
+    const s = m.stats(id);
+    return `<section class="card ${mm.left ? 'left' : ''}">
+      <div class="mhead"><span class="ord">${i + 1}</span><b>${esc(mm.name)}</b>
+        ${mm.left ? '<span class="tag">離脱</span>' : ''}${id === cur ? '<span class="tag run">走行中</span>' : ''}</div>
+      <div class="row4">
+        <div><span class="muted small">目安</span>${fmt(s.tgt)}</div>
+        <div><span class="muted small">平均</span>${fmt(s.avg)}</div>
+        <div><span class="muted small">ギャップ</span>${fmtGap(s.gap)}</div>
+        <div><span class="muted small">周回</span>${s.laps.length}周</div>
+      </div>
+      <div class="laps">${s.laps.map(l => `<button class="lap ${l.provisional ? 'prov' : ''}" data-act="lapEdit" data-idx="${l.idx}">${l.no}周 ${fmt(l.ms)}${l.ms > s.tgt * OUTLIER ? ' ⚠' : ''}</button>`).join('') || '<span class="muted small">記録なし</span>'}</div>
+      <div class="right"><button class="b sm ${mm.left ? '' : 'danger'}" data-act="${mm.left ? 'rejoin' : 'leave'}" data-id="${esc(id)}">${mm.left ? '復帰させる' : '離脱'}</button></div>
+    </section>`;
+  }).join('');
+  return cards + `<p class="muted small">黄色＝暫定タイム（自動記録）　⚠＝目安の${OUTLIER}倍超。タイムを押すと修正できます。ギャップはマイナスが目安より速い。</p>`;
+}
+
+function viewPredict(m) {
+  const t = now(), p = m.predict(t);
+  const rows = p.upcoming.slice(0, 40).map(u => `<tr class="${u.out ? 'out' : ''}"><td>${u.no}</td><td>${esc(m.name(u.runnerId))}</td><td>${clock(u.start)}</td><td>${clock(u.finish)}</td></tr>`).join('');
+  return summary(m, p) + `
+    <section class="card"><div class="grid2">
+      <div><div class="muted small">完了した周</div><div class="num sm">${p.completed}周</div></div>
+      <div><div class="muted small">貯金・借金（目安比）</div><div class="num sm">${m.started ? fmtGap(m.savings()) : '—'}</div></div>
+    </div><p class="muted small">貯金・借金はマイナスが目安より速い（貯金）。予測は各メンバーの実績平均（未走の人は申告ペース）で計算しています。</p></section>
+    <section class="card"><h2>この先の見込み</h2>
+      ${rows ? `<table><tr><th>周</th><th>走者</th><th>スタート</th><th>ゴール</th></tr>${rows}</table>
+      <p class="muted small">取り消し線の周は制限時間に間に合わない見込み（カウント外）。</p>` : '<p class="muted">見込みはありません。</p>'}
+    </section>`;
+}
+
+function viewSettings(m) {
+  const members = (team.order || []).map((id, i) => {
+    const mm = m.mem(id); if (!mm) return '';
+    return `<div class="mrow"><span class="ord">${i + 1}</span>
+      <span class="mname">${esc(mm.name)}${mm.left ? ' <span class="tag">離脱</span>' : ''}</span>
+      <input data-mpace="${esc(id)}" value="${fmt(mm.paceSec * 1000)}" inputmode="numeric" aria-label="${esc(mm.name)}のペース（分:秒/km）">
+      <span class="mbtns"><button class="b sm" data-act="memMove" data-id="${esc(id)}" data-d="-1" aria-label="上へ">▲</button><button class="b sm" data-act="memMove" data-id="${esc(id)}" data-d="1" aria-label="下へ">▼</button></span></div>`;
+  }).join('');
+  return `
+  <section class="card"><h2>大会設定</h2><div class="grid2">
+    <div><div class="muted small">大会名</div><b>${esc(race.name || '—')}</b></div>
+    <div><div class="muted small">スタート</div><b>${m.started ? clock(race.startAt) : '未スタート'}</b></div>
+    <div><div class="muted small">制限時間</div><b>${fmt(m.L, true)}</b></div>
+    <div><div class="muted small">1周の距離</div><b>${esc(race.lapKm)} km</b></div>
+  </div><p class="muted small">大会設定・チーム名・メンバーの追加や削除は管理画面で行います。</p></section>
+  <section class="card"><h2>走順とペース</h2>
+    <div class="mrow muted small"><span></span><span>名前</span><span>ペース/km</span><span></span></div>
+    ${members || '<p class="muted">メンバーが登録されていません</p>'}
+    <div class="btns"><button class="b primary" data-act="savePaces">ペースを保存</button></div>
+    <p class="muted small">当日の微修正用です。▲▼で走順を入れ替えられます（すぐに反映）。</p>
+  </section>
+  <section class="card"><h2>この端末</h2>
+    <label>ニックネーム（誰が押したかの記録用・任意）</label><input id="nick" value="${esc(nickname)}">
+    <div class="btns"><button class="b" data-act="saveNick">保存</button></div>
+    <p class="muted small">${DEMO ? 'デモモード：データはこのブラウザ内だけに保存されます。' : 'サーバーとの時刻補正：' + Math.round(offset) + 'ミリ秒'}</p>
+  </section>`;
+}
+
+function viewAfter(m) {
+  const laps = m.laps();
+  const dl = m.deadline;
+  const counted = m.started ? laps.filter(l => l.end <= dl) : [];
+  const last = counted.at(-1);
+  const prov = laps.filter(l => l.provisional);
+  const off = team.official || {};
+  const appFinishSec = last ? Math.round((last.end - race.startAt) / 1000) : null;
+  const diffLaps = off.laps != null ? counted.length - off.laps : null;
+  const diffFinish = off.finishSec != null && appFinishSec != null ? (appFinishSec - off.finishSec) * 1000 : null;
+  return `
+  <section class="card"><h2>アプリの集計</h2><div class="grid2">
+    <div><div class="muted small">制限時間内の周回数</div><div class="num sm">${counted.length}周</div></div>
+    <div><div class="muted small">最終確定周のゴール（経過）</div><div class="num sm">${appFinishSec != null ? fmt(appFinishSec * 1000, true) : '—'}</div></div>
+    <div><div class="muted small">暫定のまま</div><div class="num sm">${prov.length}件</div></div>
+  </div></section>
+  <section class="card"><h2>公式記録との照合</h2>
+    <label>公式の総周回数</label><input id="oLaps" type="number" min="0" value="${esc(off.laps ?? '')}">
+    <label>公式の最終ゴールタイム（経過 時:分:秒）</label><input id="oFinish" placeholder="5:52:10" inputmode="numeric" value="${off.finishSec != null ? fmt(off.finishSec * 1000, true) : ''}">
+    <div class="btns"><button class="b primary" data-act="saveOfficial">保存</button></div>
+    ${diffLaps != null || diffFinish != null ? `<p>周回数の差：<b>${diffLaps != null ? (diffLaps > 0 ? '+' : '') + diffLaps + '周' : '—'}</b>　ゴールの差：<b>${diffFinish != null ? fmtGap(diffFinish) : '—'}</b></p><p class="muted small">差はアプリ − 公式。暫定タイムを修正してそろえてください。</p>` : ''}
+  </section>
+  <section class="card"><h2>暫定のまま残っている周</h2>
+    ${prov.length ? `<div class="laps">${prov.map(l => `<button class="lap prov" data-act="lapEdit" data-idx="${l.idx}">${l.no}周 ${esc(m.name(l.runnerId))} ${fmt(l.ms)}</button>`).join('')}</div>` : '<p class="muted">ありません</p>'}
+  </section>
+  <section class="card"><h2>CSV書き出し</h2>
+    <button class="b primary" data-act="csv">このチームの記録をダウンロード</button>
+  </section>`;
+}
+
+function renderLive() {
+  if (!race || !team) return;
+  const m = M(), t = now();
+  const set = (k, html) => document.querySelectorAll(`[data-live="${k}"]`).forEach(e => { if (e.innerHTML !== html) e.innerHTML = html; });
+  set('raceElapsed', m.started ? fmt(Math.max(0, t - race.startAt), true) : '0:00:00');
+  set('raceRemain', m.started ? fmt(Math.max(0, m.deadline - t), true) : fmt(m.L, true));
+  if (!m.started) return;
+  const r = m.currentRunner(), el = t - m.curLapStart();
+  set('lapElapsed', fmt(Math.max(0, el)));
+  const d = m.targetMs(r) - el;
+  set('toTarget', d >= 0 ? fmt(d) : `<span class="bad">+${fmt(-d)}</span>`);
+  const lock = (team.current?.lockUntil || 0) - t;
+  document.querySelectorAll('[data-live="tapBtn"]').forEach(b => {
+    const dis = lock > 0; b.disabled = dis;
+    const txt = dis ? `記録済み（あと${Math.ceil(lock / 1000)}秒）` : 'タッチ（中継）';
+    if (b.textContent !== txt) b.textContent = txt;
+  });
+}
+
+/* ---------- 記録処理 ---------- */
+function applyTap(rc, tm, t) {
+  const m = new Model(rc, tm), cur = tm.current || {};
+  if (!rc.startAt) return { result: 'notstarted' };
+  if (t < (cur.lockUntil || 0)) return { result: 'locked' };
+  const hs = tm.handoffs || (tm.handoffs = []);
+  const runner = m.currentRunner();
+  const lapStart = m.curLapStart();
+  if (t <= lapStart) return { result: 'locked' };
+  // 暫定記録の直後（暫定記録した時点から、次走者の目安の半分以内）のタッチ → 遅れていた本当の中継として暫定時刻を訂正
+  const provAt = cur.provisionalAt || lapStart;
+  if (cur.provisional && hs.length && t - provAt <= m.targetMs(runner) / 2) {
+    const h = hs[hs.length - 1];
+    h.t = t; h.provisional = false; h.by = nickname || ''; h.off = Math.round(offset);
+    tm.current = { ...cur, provisional: false, provisionalAt: 0, lockUntil: t + LOCK_SEC * 1000 };
+    return { team: tm, result: 'overwrite' };
+  }
+  hs.push({ t, runnerId: runner, provisional: false, edited: false, by: nickname || '', off: Math.round(offset) });
+  tm.current = { runnerId: m.nextAfter(runner), provisional: false, provisionalAt: 0, lockUntil: t + LOCK_SEC * 1000 };
+  return { team: tm, result: 'ok' };
+}
+
+async function flushTaps() {
+  if (flushing) return; flushing = true;
+  while (pendingTaps.length) {
+    const t = pendingTaps[0];
+    try {
+      const before = M(); const who = before.currentRunner(); const ms = t - before.curLapStart();
+      const res = await store.transact((rc, tm) => applyTap(rc, tm, t));
+      pendingTaps.shift();
+      if (res === 'ok') toast(`記録：${before.name(who)} ${fmt(ms)}`, '取り消し', () => undoTap(t), 8000);
+      else if (res === 'overwrite') toast('暫定の中継時刻を、いまのタッチに訂正しました');
+      else if (res === 'locked') toast('直前に記録済みのため、このタッチは無視しました');
+      else if (res === 'notstarted') toast('スタート前です');
+    } catch (e) { requestRender(); await sleep(3000); }
+  }
+  flushing = false; requestRender();
+}
+
+async function undoTap(t) {
+  const res = await store.transact((rc, tm) => {
+    const hs = tm.handoffs || []; const h = hs[hs.length - 1];
+    if (!h || h.t !== t) return { result: 'gone' };
+    hs.pop(); tm.current = { runnerId: h.runnerId, provisional: false, provisionalAt: 0, lockUntil: 0 };
+    return { team: tm, result: 'ok' };
+  });
+  toast(res === 'ok' ? '取り消しました' : 'すでに次の記録があるため取り消せません。メンバータブから修正してください');
+}
+
+function autoCheck() {
+  if (autoBusy || !race?.startAt || !team) return;
+  const m = M(), t = now();
+  if (t > m.deadline) return;
+  const r = m.currentRunner(); if (!r) return;
+  const tg = m.targetMs(r); if (!(tg > 0)) return;
+  if (t - m.curLapStart() < tg + GRACE_SEC * 1000) return;
+  autoBusy = true;
+  store.transact((rc, tm) => {
+    const mm = new Model(rc, tm), rr = mm.currentRunner(), s = mm.curLapStart(), g = mm.targetMs(rr);
+    if (!rr || now() - s < g + GRACE_SEC * 1000) return null;
+    (tm.handoffs || (tm.handoffs = [])).push({ t: s + g, runnerId: rr, provisional: true, edited: false, by: '自動', off: 0 });
+    tm.current = { runnerId: mm.nextAfter(rr), provisional: true, provisionalAt: now(), lockUntil: tm.current?.lockUntil || 0 };
+    return { team: tm, result: 'auto' };
+  }).catch(() => {}).finally(() => { autoBusy = false; });
+}
+
+/* ---------- 操作 ---------- */
+const memberOpts = (m, sel) => m.members.map(x => `<option value="${esc(x.id)}" ${x.id === sel ? 'selected' : ''}>${esc(x.name)}${x.left ? '（離脱）' : ''}</option>`).join('');
+
+const ACTIONS = {
+  tab(b) { tab = b.dataset.tab; ls.set('relay.tab', tab); render(); window.scrollTo(0, 0); },
+
+  async start() {
+    if (!confirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？')) return;
+    const t = now();
+    await store.transact(rc => {
+      if (rc.startAt) return { result: 'already' };
+      return { race: { ...rc, startAt: t }, result: 'ok' };
+    });
+  },
+
+  tap() { pendingTaps.push(now()); if (navigator.vibrate) navigator.vibrate(60); flushTaps(); },
+
+  swapOpen() {
+    const m = M(), cur = m.currentRunner();
+    const list = m.activeOrder().filter(id => id !== cur);
+    openDlg(`<h3>今回の走者を差し替え</h3><p class="muted small">選んだ人が今回の走者になり、${esc(m.name(cur))}さん以降は1つずつ後ろへずれます。</p>
+      <div class="pick">${list.map(id => `<button class="b wide" data-act="swapTo" data-id="${esc(id)}">${esc(m.name(id))}</button>`).join('')}</div>
+      <div class="btns"><button class="b" data-act="dlgClose">閉じる</button></div>`);
+  },
+  async swapTo(b) {
+    const id = b.dataset.id;
+    await store.transact((rc, tm) => {
+      const m = new Model(rc, tm), cur = m.currentRunner();
+      if (id === cur) return null;
+      const ord = (tm.order || []).filter(x => x !== id);
+      let i = ord.indexOf(cur); if (i < 0) i = 0;
+      ord.splice(i, 0, id);
+      tm.order = ord; tm.current = { ...(tm.current || {}), runnerId: id };
+      return { team: tm, result: 'ok' };
+    });
+    closeDlg(); toast('走者を差し替えました');
+  },
+
+  lapEdit(b) {
+    const m = M(), idx = +b.dataset.idx, l = m.laps()[idx]; if (!l) return;
+    const isLast = idx === (team.handoffs || []).length - 1;
+    openDlg(`<h3>${l.no}周目の記録</h3>
+      <p class="muted small">経過 ${fmt(l.start - race.startAt, true)} → ${fmt(l.end - race.startAt, true)}${l.provisional ? '　<b>暫定</b>' : ''}${l.by ? '　記録：' + esc(l.by) : ''}</p>
+      <label>走者</label><select id="eRunner">${memberOpts(m, l.runnerId)}</select>
+      <label>周回タイム（分:秒）</label><input id="eTime" inputmode="numeric" value="${fmt(l.ms)}">
+      <p class="muted small">タイムを変えると、次の周のタイムが自動で連動します（合計は変わりません）。</p>
+      <div class="btns"><button class="b primary" data-act="lapSave" data-idx="${idx}" data-t="${l.end}">保存</button><button class="b" data-act="dlgClose">閉じる</button></div>
+      <details><summary>押し忘れで2人分が1周になっている（分割）</summary>
+        <label>前半の走者</label><select id="sR1">${memberOpts(m, l.runnerId)}</select>
+        <label>前半の周回タイム（分:秒）</label><input id="sTime" inputmode="numeric" placeholder="例 11:20">
+        <label>後半の走者</label><select id="sR2">${memberOpts(m, m.nextAfter(l.runnerId))}</select>
+        <div class="btns"><button class="b" data-act="lapSplit" data-idx="${idx}" data-t="${l.end}">分割する</button></div>
+      </details>
+      ${isLast ? `<details><summary>この中継記録を削除（誤タッチ）</summary><p class="muted small">この周は走行中に戻ります。</p><button class="b danger" data-act="lapDelete" data-idx="${idx}" data-t="${l.end}">削除する</button></details>` : ''}`);
+  },
+  async lapSave(b) {
+    const idx = +b.dataset.idx, orig = +b.dataset.t, sec = parseDur($('#eTime').value), rid = $('#eRunner').value;
+    need(sec > 0, 'タイムは 11:20 のように入力してください');
+    await store.transact((rc, tm) => {
+      const hs = tm.handoffs || [], h = hs[idx];
+      need(h && h.t === orig, '他の端末で記録が変わりました。開き直してください');
+      const start = idx ? hs[idx - 1].t : rc.startAt, end = start + sec * 1000;
+      const limit = hs[idx + 1] ? hs[idx + 1].t : now();
+      need(end > start && end < limit, 'このタイムだと次の周と矛盾します');
+      h.t = end; h.runnerId = rid; h.provisional = false; h.edited = true;
+      if (idx === hs.length - 1 && tm.current) { tm.current.provisional = false; tm.current.provisionalAt = 0; }
+      return { team: tm, result: 'ok' };
+    });
+    closeDlg(); toast('修正しました');
+  },
+  async lapSplit(b) {
+    const idx = +b.dataset.idx, orig = +b.dataset.t, sec = parseDur($('#sTime').value), r1 = $('#sR1').value, r2 = $('#sR2').value;
+    need(sec > 0, '前半のタイムを 11:20 のように入力してください');
+    await store.transact((rc, tm) => {
+      const hs = tm.handoffs || [], h = hs[idx];
+      need(h && h.t === orig, '他の端末で記録が変わりました。開き直してください');
+      const start = idx ? hs[idx - 1].t : rc.startAt, mid = start + sec * 1000;
+      need(mid > start && mid < h.t, '前半のタイムが元の周より長くなっています');
+      hs.splice(idx, 0, { t: mid, runnerId: r1, provisional: false, edited: true, by: nickname || '', off: 0 });
+      h.runnerId = r2; h.edited = true; h.provisional = false;
+      return { team: tm, result: 'ok' };
+    });
+    closeDlg(); toast('2周に分割しました');
+  },
+  async lapDelete(b) {
+    const idx = +b.dataset.idx, orig = +b.dataset.t;
+    await store.transact((rc, tm) => {
+      const hs = tm.handoffs || [], h = hs[idx];
+      need(h && h.t === orig && idx === hs.length - 1, '他の端末で記録が変わりました。開き直してください');
+      hs.pop(); tm.current = { runnerId: h.runnerId, provisional: false, provisionalAt: 0, lockUntil: 0 };
+      return { team: tm, result: 'ok' };
+    });
+    closeDlg(); toast('削除しました');
+  },
+
+  async leave(b) { await setLeft(b.dataset.id, true); toast('離脱にしました。以後の走順から外れます'); },
+  async rejoin(b) { await setLeft(b.dataset.id, false); toast('走順に戻しました'); },
+
+  async savePaces() {
+    const paces = {};
+    document.querySelectorAll('[data-mpace]').forEach(i => { paces[i.dataset.mpace] = parseDur(i.value); });
+    for (const v of Object.values(paces)) need(v > 0, 'ペースは 5:30 のように全員分入力してください');
+    await store.transact((rc, tm) => {
+      (tm.members || []).forEach(mm => { if (paces[mm.id] > 0) mm.paceSec = paces[mm.id]; });
+      return { team: tm, result: 'ok' };
+    });
+    document.activeElement?.blur(); toast('ペースを保存しました');
+  },
+  async memMove(b) {
+    const id = b.dataset.id, dir = +b.dataset.d;
+    await store.transact((rc, tm) => {
+      const o = tm.order || [], i = o.indexOf(id), j = i + dir;
+      if (i < 0 || j < 0 || j >= o.length) return null;
+      [o[i], o[j]] = [o[j], o[i]];
+      return { team: tm, result: 'ok' };
+    });
+  },
+  saveNick() { nickname = $('#nick').value.trim(); ls.set('relay.nick', nickname); document.activeElement?.blur(); toast('保存しました'); },
+
+  async saveOfficial() {
+    const lv = $('#oLaps').value.trim(), fv = $('#oFinish').value.trim();
+    const laps = lv === '' ? null : parseInt(lv, 10), fin = fv === '' ? null : parseDur(fv);
+    need(laps == null || laps >= 0, '周回数が不正です'); need(fv === '' || fin != null, 'ゴールタイムは 5:52:10 のように入力してください');
+    await store.transact((rc, tm) => { tm.official = { laps, finishSec: fin }; return { team: tm, result: 'ok' }; });
+    document.activeElement?.blur(); toast('保存しました');
+  },
+  csv() {
+    need(race.startAt, 'まだスタートしていません');
+    download(`relay_${race.name || ''}_${team.name || ''}.csv`, buildCsv(race, team));
+  },
+  dlgClose() { closeDlg(); },
+};
+
+async function setLeft(id, left) {
+  await store.transact((rc, tm) => { const mm = (tm.members || []).find(x => x.id === id); if (!mm) return null; mm.left = left; return { team: tm, result: 'ok' }; });
+}
+
+document.addEventListener('click', async e => {
+  wake();
+  const b = e.target.closest('[data-act]'); if (!b || b.disabled) return;
+  const fn = ACTIONS[b.dataset.act]; if (!fn) return;
+  try { await fn(b); } catch (err) { toast(err.message || String(err)); }
+});
+
+/* ---------- 画面スリープ防止 ---------- */
+let wl = null;
+async function wake() { try { if ('wakeLock' in navigator && !wl && document.visibilityState === 'visible') { wl = await navigator.wakeLock.request('screen'); wl.addEventListener('release', () => { wl = null; }); } } catch {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') wake(); });
+
+/* ---------- 起動 ---------- */
+function tick() {
+  if (!race || !team) return;
+  autoCheck(); renderLive();
+  if (++tickN % 20 === 0 && (tab === 'main' || tab === 'predict')) requestRender();
+}
+
+async function boot() {
+  if (!teamWord) {
+    if (DEMO) {
+      app.innerHTML = `<section class="card"><h2>デモモード</h2>
+        <p>Firebaseがまだ設定されていないため、このブラウザ内だけで動くデモとして起動しています。</p>
+        <div class="pick"><a class="b wide center" href="./admin/">管理画面を開く</a><a class="b wide center" href="?team=demo-team-a1">チームAで開く</a><a class="b wide center" href="?team=demo-team-b2">チームBで開く</a></div>
+        <p class="muted small">管理画面で作ったチームは、管理画面の「開く」から入れます。同じチームを2つのタブで開くと、複数端末での同期の動きを試せます。</p></section>`;
+      return;
+    }
+    return fatal('チーム用のURL（末尾が ?team=合言葉 のもの）から開いてください。');
+  }
+  try { store = await openTeam(teamWord, fatal); }
+  catch (e) { return fatal(e.message === 'team-not-found' ? 'チームが見つかりません。URLの合言葉を確認してください。' : '接続に失敗しました：' + e.message); }
+  try { offset = await store.clockOffset(); } catch { offset = 0; }
+  setInterval(async () => { try { offset = await store.clockOffset(); } catch {} }, 5 * 60 * 1000);
+  store.subscribe((r, t) => {
+    if (!t) return fatal('チームが見つかりません（削除された可能性があります）。');
+    if (!r) return fatal('大会データが見つかりません。');
+    race = r; team = t; requestRender();
+  });
+  setInterval(tick, 250);
+}
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1f6feb">
+<meta name="robots" content="noindex">
+<title>リレー管理画面</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<header><div class="hwrap"><div><div class="htitle">リレー管理画面</div><div class="hsub" id="hSub"></div></div><div class="hclock" id="hClock"></div></div></header>
+<main id="app" style="padding-bottom:40px"><div class="card center muted">読み込み中…</div></main>
+<dialog id="dlg"><div id="dlgBody"></div></dialog>
+<div id="toast"><span id="toastMsg"></span><button id="toastBtn" hidden></button></div>
+
+<script type="module">
+import { $, esc, fmt, parseDur, clock, ls, uid, need, Model, buildCsv, download, toast, openDlg, closeDlg, makeRenderer, randomWord, WORD_RE } from '../js/core.js';
+import { DEMO, openAdmin } from '../js/store.js';
+
+let api = null, user = null, denied = false, offset = 0;
+let races = [], raceId = ls.get('relay.admin.race') || '', teams = [];
+let unsubRaces = null, unsubTeams = null, draft = null;
+const now = () => Date.now() + offset;
+const app = $('#app');
+const curRace = () => races.find(r => r.id === raceId) || null;
+const teamUrl = word => new URL('../?team=' + encodeURIComponent(word), location.href).href;
+
+/* ---------- 画面 ---------- */
+function render() {
+  $('#hSub').innerHTML = user ? esc(user.email) + (DEMO ? ' <span class="tag demo">デモ</span>' : '') : '';
+  if (!user) {
+    app.innerHTML = `<section class="card center"><h2>管理画面</h2>
+      <p class="muted">大会とチームの登録・管理を行います。管理者のGoogleアカウントでログインしてください。</p>
+      <button class="b primary wide" data-act="signIn">Googleでログイン</button></section>`;
+    return;
+  }
+  if (denied) {
+    app.innerHTML = `<section class="card"><h2>管理権限がありません</h2>
+      <p>${esc(user.email)} は管理者として登録されていません。</p>
+      <button class="b" data-act="signOut">ログアウト</button></section>`;
+    return;
+  }
+  const r = curRace();
+  app.innerHTML = viewRaces() + (r ? viewRace(r) + viewTeams(r) : '');
+  renderLive();
+}
+const requestRender = makeRenderer(app, render);
+
+function viewRaces() {
+  const opts = races.map(r => `<option value="${esc(r.id)}" ${r.id === raceId ? 'selected' : ''}>${esc(r.name || '（無題）')}</option>`).join('');
+  return `<section class="card"><h2>大会</h2>
+    ${races.length ? `<label>管理する大会</label><select id="raceSel">${opts}</select>` : '<p class="muted">まだ大会がありません。まず大会を作成してください。</p>'}
+    <div class="btns"><button class="b" data-act="raceNew">新しい大会を作成</button>
+      ${DEMO ? '<button class="b sm danger" data-act="demoReset">デモデータを初期化</button>' : '<button class="b sm" data-act="signOut">ログアウト</button>'}</div>
+  </section>`;
+}
+
+function viewRace(r) {
+  const started = !!r.startAt;
+  return `<section class="card"><h2>大会設定（全チーム共通）</h2>
+    <label>大会名</label><input id="rName" value="${esc(r.name || '')}">
+    <label>制限時間（時間）</label><input id="rLimit" type="number" step="0.25" min="0.25" value="${esc(r.limitHours ?? '')}">
+    <label>1周の距離（km）</label><input id="rLap" type="number" step="0.01" min="0.01" value="${esc(r.lapKm ?? '')}">
+    <div class="btns"><button class="b primary" data-act="saveRace">大会設定を保存</button></div>
+    ${started ? '<p class="muted small">スタート後に制限時間・距離を変えると、予測と周回カウントが変わります。</p>' : ''}
+  </section>
+  <section class="card center">
+    <div class="muted">${started ? 'スタート ' + clock(r.startAt) : '未スタート'}</div>
+    <div class="timer" data-live="elapsed">0:00:00</div>
+    <div class="muted small">残り <span data-live="remain">—</span></div>
+    ${started
+      ? `<div class="btns" style="justify-content:center"><button class="b danger" data-act="resetRace">スタートと全チームの記録をリセット</button></div>`
+      : `<button class="touch start" data-act="start">スタート</button><div class="muted small">全チーム共通です。チーム画面のスタートボタンからも同じくスタートできます</div>`}
+  </section>`;
+}
+
+function viewTeams(r) {
+  const cards = teams.map(t => {
+    const m = new Model(r, t), p = m.predict(now()), url = teamUrl(t.word);
+    const rows = (t.order || []).map((id, i) => {
+      const x = m.mem(id); if (!x) return '';
+      return `<tr class="${x.left ? 'out' : ''}"><td>${i + 1}</td><td>${esc(x.name)}</td><td>${fmt(x.paceSec * 1000)}</td><td>${fmt(m.targetMs(id))}</td></tr>`;
+    }).join('');
+    const w = esc(t.word);
+    return `<section class="card">
+      <div class="mhead"><b style="font-size:16px">${esc(t.name)}</b><span class="tag">${m.activeOrder().length}人</span></div>
+      <label>チーム用URL（メンバーに配布）</label><div class="url">${esc(url)}</div>
+      <div class="btns"><button class="b sm" data-act="copyUrl" data-url="${esc(url)}">URLをコピー</button><a class="b sm" href="${esc(url)}" target="_blank" rel="noopener">開く</a></div>
+      ${m.started ? `<p class="small">完了 <b>${p.completed}周</b> ・ 走行中 <b>${esc(m.name(m.currentRunner()))}</b> ・ 予想 <b>${p.count}周</b></p>` : ''}
+      ${rows ? `<table><tr><th>順</th><th>名前</th><th>ペース/km</th><th>目安/周</th></tr>${rows}</table>` : '<p class="muted">メンバー未登録</p>'}
+      <div class="btns">
+        <button class="b primary sm" data-act="memEdit" data-word="${w}">メンバー・チーム名を編集</button>
+        <button class="b sm" data-act="csv" data-word="${w}">CSV</button>
+        <button class="b sm danger" data-act="teamDel" data-word="${w}">削除</button>
+      </div>
+    </section>`;
+  }).join('');
+  return `<h2 class="sec">チーム（${teams.length}）</h2>${cards}
+    <button class="b primary wide" data-act="teamNew">新しいチームを作成</button>`;
+}
+
+function renderLive() {
+  const r = curRace(); if (!r) { $('#hClock').innerHTML = ''; return; }
+  const L = (Number(r.limitHours) || 0) * 3600e3, t = now();
+  const el = r.startAt ? Math.max(0, t - r.startAt) : 0, rem = r.startAt ? Math.max(0, r.startAt + L - t) : L;
+  $('#hClock').innerHTML = `経過 <b>${fmt(el, true)}</b><br>残り ${fmt(rem, true)}`;
+  document.querySelectorAll('[data-live="elapsed"]').forEach(e => { e.textContent = fmt(el, true); });
+  document.querySelectorAll('[data-live="remain"]').forEach(e => { e.textContent = fmt(rem, true); });
+}
+
+/* ---------- メンバー編集ダイアログ ---------- */
+function openDraft(t) {
+  const m = new Model(curRace(), t);
+  draft = {
+    word: t.word, name: t.name,
+    rows: (t.order || []).map(id => m.mem(id)).filter(Boolean).map(x => ({ id: x.id, name: x.name, pace: fmt(x.paceSec * 1000), left: !!x.left, hasLaps: m.stats(x.id).laps.length > 0 })),
+  };
+  renderDraft();
+}
+function syncDraft() {
+  if (!draft) return;
+  const n = $('#dTeamName'); if (n) draft.name = n.value;
+  draft.rows.forEach((r, i) => {
+    const a = document.querySelector(`[data-dname="${i}"]`), b = document.querySelector(`[data-dpace="${i}"]`);
+    if (a) r.name = a.value; if (b) r.pace = b.value;
+  });
+}
+function renderDraft() {
+  const rows = draft.rows.map((r, i) => `<div class="drow"><span class="ord">${i + 1}</span>
+    <input data-dname="${i}" value="${esc(r.name)}" placeholder="名前" aria-label="名前">
+    <input data-dpace="${i}" value="${esc(r.pace)}" placeholder="5:30" inputmode="numeric" aria-label="ペース">
+    <span class="mbtns"><button class="b sm" data-act="dMove" data-i="${i}" data-d="-1" aria-label="上へ">▲</button><button class="b sm" data-act="dMove" data-i="${i}" data-d="1" aria-label="下へ">▼</button>${r.hasLaps ? '' : `<button class="b sm danger" data-act="dDel" data-i="${i}" aria-label="削除">×</button>`}</span></div>`).join('');
+  openDlg(`<h3>メンバー・チーム名を編集</h3>
+    <label>チーム名</label><input id="dTeamName" value="${esc(draft.name)}">
+    <label>メンバー（上から走順）</label>
+    <div class="drow muted small"><span></span><span>名前</span><span>ペース/km</span><span></span></div>
+    ${rows || '<p class="muted small">まだいません</p>'}
+    <div class="btns"><button class="b sm" data-act="dAdd">＋ メンバーを追加</button></div>
+    <p class="muted small">ペースは全員必須（例 5:30）。記録がある人は削除できません（離脱はチーム画面から）。</p>
+    <div class="btns"><button class="b primary" data-act="dSave">保存</button><button class="b" data-act="dlgClose">閉じる</button></div>`);
+}
+
+/* ---------- 操作 ---------- */
+function selectRace(id) {
+  if (unsubTeams) { unsubTeams(); unsubTeams = null; }
+  raceId = id || ''; teams = []; ls.set('relay.admin.race', raceId);
+  if (raceId) unsubTeams = api.subscribeTeams(raceId, ts => { teams = ts.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ja')); requestRender(); }, onDenied);
+  requestRender();
+}
+function onDenied(e) { console.error(e); denied = true; render(); }
+
+const ACTIONS = {
+  async signIn() { await api.signIn(); },
+  async signOut() { await api.signOut(); },
+
+  raceNew() {
+    openDlg(`<h3>新しい大会を作成</h3>
+      <label>大会名</label><input id="nName" placeholder="秋の6時間リレー">
+      <label>制限時間（時間）</label><input id="nLimit" type="number" step="0.25" min="0.25" placeholder="6">
+      <label>1周の距離（km）</label><input id="nLap" type="number" step="0.01" min="0.01" placeholder="2">
+      <div class="btns"><button class="b primary" data-act="raceCreate">作成</button><button class="b" data-act="dlgClose">閉じる</button></div>`);
+  },
+  async raceCreate() {
+    const name = $('#nName').value.trim(), limitHours = parseFloat($('#nLimit').value), lapKm = parseFloat($('#nLap').value);
+    need(name, '大会名を入力してください'); need(limitHours > 0, '制限時間を入力してください'); need(lapKm > 0, '1周の距離を入力してください');
+    const id = await api.createRace({ name, limitHours, lapKm });
+    closeDlg(); selectRace(id); toast('大会を作成しました');
+  },
+  async saveRace() {
+    const name = $('#rName').value.trim(), limitHours = parseFloat($('#rLimit').value), lapKm = parseFloat($('#rLap').value);
+    need(name, '大会名を入力してください'); need(limitHours > 0, '制限時間を入力してください'); need(lapKm > 0, '1周の距離を入力してください');
+    await api.updateRace(raceId, r => ({ ...r, name, limitHours, lapKm }));
+    document.activeElement?.blur(); toast('大会設定を保存しました');
+  },
+  async start() {
+    need(teams.length, 'チームがありません');
+    if (!confirm('スタートします。全チーム共通のスタート時刻になります。よろしいですか？')) return;
+    const t = now();
+    await api.updateRace(raceId, r => r.startAt ? null : { ...r, startAt: t });
+    toast('スタートしました');
+  },
+  async resetRace() {
+    if (!confirm('スタート時刻と、この大会の全チームの記録をすべて消します。よろしいですか？')) return;
+    await api.resetRace(raceId); toast('リセットしました');
+  },
+
+  teamNew() {
+    openDlg(`<h3>新しいチームを作成</h3>
+      <label>チーム名</label><input id="tName" placeholder="チームA">
+      <label>合言葉ワード（チーム用URLの鍵）</label><input id="tWord" value="${randomWord()}" autocapitalize="off" autocomplete="off" spellcheck="false">
+      <div class="btns"><button class="b sm" data-act="regenWord">別のワードを生成</button></div>
+      <p class="muted small">英数字とハイフンで12文字以上。推測されにくいワードにしてください。作成後は変更できません。</p>
+      <div class="btns"><button class="b primary" data-act="teamCreate">作成</button><button class="b" data-act="dlgClose">閉じる</button></div>`);
+  },
+  regenWord() { $('#tWord').value = randomWord(); },
+  async teamCreate() {
+    const name = $('#tName').value.trim(), word = $('#tWord').value.trim();
+    need(name, 'チーム名を入力してください');
+    need(WORD_RE.test(word), '合言葉は英数字とハイフンで12文字以上にしてください');
+    await api.createTeam(word, { name, raceId });
+    closeDlg(); toast('チームを作成しました。メンバーを登録してください');
+  },
+  async copyUrl(b) {
+    try { await navigator.clipboard.writeText(b.dataset.url); toast('URLをコピーしました'); }
+    catch { prompt('このURLをコピーしてください', b.dataset.url); }
+  },
+
+  memEdit(b) { const t = teams.find(x => x.word === b.dataset.word); if (t) openDraft(t); },
+  dMove(b) {
+    syncDraft(); const i = +b.dataset.i, j = i + +b.dataset.d;
+    if (j < 0 || j >= draft.rows.length) return;
+    [draft.rows[i], draft.rows[j]] = [draft.rows[j], draft.rows[i]]; renderDraft();
+  },
+  dDel(b) { syncDraft(); draft.rows.splice(+b.dataset.i, 1); renderDraft(); },
+  dAdd() { syncDraft(); draft.rows.push({ id: uid(), name: '', pace: '', left: false, hasLaps: false, isNew: true }); renderDraft(); document.querySelector(`[data-dname="${draft.rows.length - 1}"]`)?.focus(); },
+  async dSave() {
+    syncDraft();
+    const name = draft.name.trim(); need(name, 'チーム名を入力してください');
+    const rows = draft.rows.map(r => ({ ...r, name: r.name.trim(), paceSec: parseDur(r.pace) }));
+    for (const r of rows) { need(r.name, '名前が空のメンバーがいます'); need(r.paceSec > 0, `${r.name} のペースを 5:30 のように入力してください`); }
+    await api.updateTeam(draft.word, tm => {
+      const keep = new Set(rows.map(r => r.id));
+      const withLaps = new Set((tm.handoffs || []).map(h => h.runnerId));
+      need([...withLaps].every(id => keep.has(id)), '記録がある人は削除できません。開き直してください');
+      const old = Object.fromEntries((tm.members || []).map(x => [x.id, x]));
+      tm.name = name;
+      tm.members = rows.map(r => ({ id: r.id, name: r.name, paceSec: r.paceSec, left: !!old[r.id]?.left }));
+      tm.order = rows.map(r => r.id);
+      if (tm.current?.runnerId && !keep.has(tm.current.runnerId)) tm.current.runnerId = null;
+      return tm;
+    });
+    draft = null; closeDlg(); toast('保存しました');
+  },
+
+  csv(b) {
+    const t = teams.find(x => x.word === b.dataset.word), r = curRace(); if (!t || !r) return;
+    need(r.startAt, 'まだスタートしていません');
+    download(`relay_${r.name}_${t.name}.csv`, buildCsv(r, t));
+  },
+  async teamDel(b) {
+    const t = teams.find(x => x.word === b.dataset.word); if (!t) return;
+    if (!confirm(`「${t.name}」を削除します。メンバーと記録もすべて消えます。よろしいですか？`)) return;
+    await api.deleteTeam(t.word); toast('削除しました');
+  },
+  demoReset() { if (confirm('デモデータを初期化しますか？')) { api.resetDemo(); selectRace('demo'); toast('初期化しました'); } },
+  dlgClose() { draft = null; closeDlg(); },
+};
+
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b || b.disabled) return;
+  const fn = ACTIONS[b.dataset.act]; if (!fn) return;
+  try { await fn(b); } catch (err) { toast(err.message || String(err)); }
+});
+document.addEventListener('change', e => { if (e.target.id === 'raceSel') { e.target.blur(); selectRace(e.target.value); } });
+
+/* ---------- 起動 ---------- */
+async function boot() {
+  try { api = await openAdmin(); }
+  catch (e) { app.innerHTML = `<div class="card"><h2>表示できません</h2><p>${esc(e.message)}</p></div>`; return; }
+  api.onUser(async u => {
+    user = u; denied = false; races = [];
+    if (unsubRaces) { unsubRaces(); unsubRaces = null; }
+    if (unsubTeams) { unsubTeams(); unsubTeams = null; }
+    teams = [];
+    if (!u) { render(); return; }
+    render();
+    try { offset = await api.clockOffset(); } catch { offset = 0; }
+    unsubRaces = api.subscribeRaces(rs => {
+      races = rs.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ja'));
+      if (!races.some(r => r.id === raceId)) selectRace(races[0]?.id || '');
+      else if (!unsubTeams) selectRace(raceId);
+      requestRender();
+    }, onDenied);
+  });
+  setInterval(renderLive, 500);
+}
+boot();
+</script>
+</body>
+</html>

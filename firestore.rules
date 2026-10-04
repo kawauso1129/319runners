@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    // ▼ 管理者のGoogleアカウントのメールアドレスに書き換えてください（複数可）
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.get('email_verified', false) == true
+        && request.auth.token.get('email', '') in ['ADMIN_EMAIL@example.com'];
+    }
+
+    // チーム：文書ID＝合言葉ワード
+    match /teams/{word} {
+      allow get: if signedIn();                        // ワードを知っている人だけがたどり着ける
+      allow list, create, delete: if isAdmin();        // 一覧・作成・削除は管理者のみ
+      allow update: if isAdmin()
+        || (signedIn()
+            && request.resource.data.raceId == resource.data.raceId   // 所属大会は変更不可
+            && request.resource.data.name == resource.data.name);     // チーム名は管理者のみ
+    }
+
+    // 大会：文書IDはチームの raceId からしか分からない
+    match /races/{raceId} {
+      allow get: if signedIn();
+      allow list, create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (signedIn()                                                 // チーム画面のスタートボタン：
+            && resource.data.startAt == null                           //   未スタートのときに
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['startAt'])); // startAt だけ書ける
+    }
+
+    // 時刻補正用：各端末が自分の文書だけ使う
+    match /clock/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+  }
+}
