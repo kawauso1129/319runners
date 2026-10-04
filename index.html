@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="ja">
 <head>
@@ -262,16 +263,17 @@ async function undoTap(t) {
 }
 
 function autoCheck() {
-  if (autoBusy || !race?.startAt || !team) return;
+  // 自動の暫定記録は「1回だけ」。暫定記録中は次の自動記録をしない（連鎖して大量の周が入るのを防ぐ）
+  if (autoBusy || !race?.startAt || !team || team.current?.provisional) return;
   const m = M(), t = now();
   if (t > m.deadline) return;
   const r = m.currentRunner(); if (!r) return;
-  const tg = m.targetMs(r); if (!(tg > 0)) return;
+  const tg = m.targetMs(r); if (!(tg >= 60000)) return; // 目安が1分未満は設定ミスとみなして自動記録しない
   if (t - m.curLapStart() < tg + GRACE_SEC * 1000) return;
   autoBusy = true;
   store.transact((rc, tm) => {
     const mm = new Model(rc, tm), rr = mm.currentRunner(), s = mm.curLapStart(), g = mm.targetMs(rr);
-    if (!rr || now() - s < g + GRACE_SEC * 1000) return null;
+    if (tm.current?.provisional || !rr || !(g >= 60000) || now() - s < g + GRACE_SEC * 1000) return null;
     (tm.handoffs || (tm.handoffs = [])).push({ t: s + g, runnerId: rr, provisional: true, edited: false, by: '自動', off: 0 });
     tm.current = { runnerId: mm.nextAfter(rr), provisional: true, provisionalAt: now(), lockUntil: tm.current?.lockUntil || 0 };
     return { team: tm, result: 'auto' };
